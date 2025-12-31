@@ -35,10 +35,10 @@ output "instance_type" {
 
 output "ami_id" {
   description = "AMI ID used for the instance"
-  value       = data.aws_ami.amazon_linux_2023.id
+  value       = data.aws_ami.ubuntu.id
 }
 
 output "ami_name" {
   description = "AMI name used for the instance"
-  value       = data.aws_ami.amazon_linux_2023.name
+  value       = data.aws_ami.ubuntu.name
 }

@@ -64,14 +64,15 @@ resource "aws_security_group" "web_sg" {
   }
 }
 
-# Récupérer la dernière AMI Amazon Linux 2023
-data "aws_ami" "amazon_linux_2023" {
+# Utiliser une AMI Ubuntu au lieu de Amazon Linux 2023
+# Ubuntu a moins de restrictions sur les volumes EBS en Sandbox
+data "aws_ami" "ubuntu" {
   most_recent = true
-  owners      = ["amazon"]
+  owners      = ["099720109477"] # Canonical (Ubuntu)
 
   filter {
     name   = "name"
-    values = ["al2023-ami-*-x86_64"]
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
   }
 
   filter {
@@ -80,9 +81,9 @@ data "aws_ami" "amazon_linux_2023" {
   }
 }
 
-# Instance EC2 - Configuration simplifiée pour AWS Sandbox
+# Instance EC2 - Configuration ultra-simplifiée pour AWS Sandbox
 resource "aws_instance" "web_server" {
-  ami           = data.aws_ami.amazon_linux_2023.id
+  ami           = data.aws_ami.ubuntu.id
   instance_type = var.instance_type
   
   # Configuration réseau minimale
@@ -90,28 +91,35 @@ resource "aws_instance" "web_server" {
   vpc_security_group_ids      = [aws_security_group.web_sg.id]
   associate_public_ip_address = true
 
-  # SUPPRIMÉ: root_block_device (non supporté en Sandbox)
-  # SUPPRIMÉ: metadata_options (utilise les défauts)
-  # SUPPRIMÉ: monitoring (utilise les défauts)
-
-  user_data = <<-EOF
+  # User data pour Ubuntu
+  user_data = base64encode(<<-EOF
               #!/bin/bash
               set -e
               
+              # Log de démarrage
+              exec > >(tee /var/log/user-data.log)
+              exec 2>&1
+              echo "Starting user data script..."
+              
               # Mise à jour du système
-              dnf update -y
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
               
               # Installation Apache
-              dnf install -y httpd
+              DEBIAN_FRONTEND=noninteractive apt-get install -y apache2
               
               # Démarrage Apache
-              systemctl start httpd
-              systemctl enable httpd
+              systemctl enable apache2
+              systemctl start apache2
+              
+              # Installation de ec2-instance-connect pour les métadonnées
+              apt-get install -y ec2-instance-connect
               
               # Récupérer les métadonnées de l'instance
-              INSTANCE_ID=$(ec2-metadata --instance-id | cut -d " " -f 2)
-              AZ=$(ec2-metadata --availability-zone | cut -d " " -f 2)
-              PUBLIC_IP=$(ec2-metadata --public-ipv4 | cut -d " " -f 2)
+              TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null)
+              INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null)
+              AZ=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone 2>/dev/null)
+              PUBLIC_IP=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null)
               
               # Page d'accueil personnalisée
               cat > /var/www/html/index.html <<'HTML'
@@ -209,6 +217,10 @@ resource "aws_instance" "web_server" {
                               <span class="label">Instance Type:</span>
                               <span class="value">${var.instance_type}</span>
                           </div>
+                          <div class="info-item">
+                              <span class="label">OS:</span>
+                              <span class="value">Ubuntu 22.04 LTS</span>
+                          </div>
                       </div>
                       <div>
                           <span class="badge">✅ Terraform</span>
@@ -231,9 +243,11 @@ resource "aws_instance" "web_server" {
               
               # Permissions
               chmod 644 /var/www/html/index.html
+              chown www-data:www-data /var/www/html/index.html
               
-              echo "✅ User data script completed successfully" >> /var/log/user-data.log
+              echo "✅ User data script completed successfully"
               EOF
+  )
 
   tags = {
     Name        = "${var.project_name}-web-server"
