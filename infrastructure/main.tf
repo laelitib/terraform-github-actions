@@ -30,7 +30,7 @@ data "aws_subnets" "default" {
 # Security Group pour le serveur web
 resource "aws_security_group" "web_sg" {
   name_prefix = "web-server-sg-"
-  description = "Security group for web server - Managed by Terraform"
+  description = "Security group for web server"
   vpc_id      = data.aws_vpc.default.id
 
   ingress {
@@ -62,10 +62,6 @@ resource "aws_security_group" "web_sg" {
     ManagedBy = "Terraform"
     Project   = var.project_name
   }
-
-  lifecycle {
-    create_before_destroy = true
-  }
 }
 
 # Récupérer la dernière AMI Amazon Linux 2023
@@ -84,17 +80,24 @@ data "aws_ami" "amazon_linux_2023" {
   }
 }
 
-# Instance EC2
+# Instance EC2 - Configuration simplifiée pour AWS Sandbox
 resource "aws_instance" "web_server" {
   ami           = data.aws_ami.amazon_linux_2023.id
   instance_type = var.instance_type
   
+  # Configuration réseau minimale
   subnet_id                   = tolist(data.aws_subnets.default.ids)[0]
   vpc_security_group_ids      = [aws_security_group.web_sg.id]
   associate_public_ip_address = true
 
+  # SUPPRIMÉ: root_block_device (non supporté en Sandbox)
+  # SUPPRIMÉ: metadata_options (utilise les défauts)
+  # SUPPRIMÉ: monitoring (utilise les défauts)
+
   user_data = <<-EOF
               #!/bin/bash
+              set -e
+              
               # Mise à jour du système
               dnf update -y
               
@@ -104,6 +107,11 @@ resource "aws_instance" "web_server" {
               # Démarrage Apache
               systemctl start httpd
               systemctl enable httpd
+              
+              # Récupérer les métadonnées de l'instance
+              INSTANCE_ID=$(ec2-metadata --instance-id | cut -d " " -f 2)
+              AZ=$(ec2-metadata --availability-zone | cut -d " " -f 2)
+              PUBLIC_IP=$(ec2-metadata --public-ipv4 | cut -d " " -f 2)
               
               # Page d'accueil personnalisée
               cat > /var/www/html/index.html <<'HTML'
@@ -156,14 +164,24 @@ resource "aws_instance" "web_server" {
                           font-weight: bold;
                           color: #667eea;
                       }
+                      .value {
+                          color: #4a5568;
+                          font-family: 'Courier New', monospace;
+                      }
                       .badge {
                           display: inline-block;
                           background: #48bb78;
                           color: white;
-                          padding: 5px 15px;
+                          padding: 8px 20px;
                           border-radius: 20px;
                           font-size: 0.9em;
                           margin: 10px 5px;
+                          font-weight: bold;
+                      }
+                      .footer {
+                          margin-top: 30px;
+                          color: #718096;
+                          font-size: 0.9em;
                       }
                   </style>
               </head>
@@ -176,13 +194,20 @@ resource "aws_instance" "web_server" {
                       </p>
                       <div class="info">
                           <div class="info-item">
-                              <span class="label">Instance:</span> $(ec2-metadata --instance-id | cut -d " " -f 2)
+                              <span class="label">Instance ID:</span>
+                              <span class="value">INSTANCE_ID_PLACEHOLDER</span>
                           </div>
                           <div class="info-item">
-                              <span class="label">Zone:</span> $(ec2-metadata --availability-zone | cut -d " " -f 2)
+                              <span class="label">Availability Zone:</span>
+                              <span class="value">AZ_PLACEHOLDER</span>
                           </div>
                           <div class="info-item">
-                              <span class="label">Type:</span> ${var.instance_type}
+                              <span class="label">Public IP:</span>
+                              <span class="value">IP_PLACEHOLDER</span>
+                          </div>
+                          <div class="info-item">
+                              <span class="label">Instance Type:</span>
+                              <span class="value">${var.instance_type}</span>
                           </div>
                       </div>
                       <div>
@@ -190,13 +215,24 @@ resource "aws_instance" "web_server" {
                           <span class="badge">✅ GitHub Actions</span>
                           <span class="badge">✅ AWS EC2</span>
                       </div>
+                      <div class="footer">
+                          <p>Déployé automatiquement depuis GitHub</p>
+                          <p>Projet: ${var.project_name}</p>
+                      </div>
                   </div>
               </body>
               </html>
               HTML
               
+              # Remplacer les placeholders par les vraies valeurs
+              sed -i "s/INSTANCE_ID_PLACEHOLDER/$INSTANCE_ID/g" /var/www/html/index.html
+              sed -i "s/AZ_PLACEHOLDER/$AZ/g" /var/www/html/index.html
+              sed -i "s/IP_PLACEHOLDER/$PUBLIC_IP/g" /var/www/html/index.html
+              
               # Permissions
               chmod 644 /var/www/html/index.html
+              
+              echo "✅ User data script completed successfully" >> /var/log/user-data.log
               EOF
 
   tags = {
@@ -205,10 +241,6 @@ resource "aws_instance" "web_server" {
     ManagedBy   = "Terraform"
     Project     = var.project_name
     DeployedBy  = "GitHub-Actions"
-  }
-
-  lifecycle {
-    create_before_destroy = true
   }
 }
 
