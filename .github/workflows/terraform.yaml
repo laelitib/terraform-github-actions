@@ -1,0 +1,306 @@
+name: AWS Infrastructure Automation
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'infrastructure/**'
+      - 'bootstrap/**'
+      - '.github/workflows/terraform.yml'
+  
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - apply
+          - destroy
+          - plan
+        default: 'apply'
+      
+      bootstrap:
+        description: 'Run bootstrap (create S3 bucket)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: 1.0.0
+  PROJECT_NAME: terraform-github-actions
+
+jobs:
+  # Job 1: Bootstrap (création du bucket S3)
+  bootstrap:
+    name: Bootstrap S3 Backend
+    runs-on: ubuntu-latest
+    if: github.event.inputs.bootstrap == 'true' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[bootstrap]'))
+    
+    outputs:
+      bucket_name: ${{ steps.tf_output.outputs.bucket_name }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Bootstrap - Terraform Init
+        working-directory: ./bootstrap
+        run: terraform init
+
+      - name: Bootstrap - Terraform Validate
+        working-directory: ./bootstrap
+        run: terraform validate
+
+      - name: Bootstrap - Terraform Plan
+        working-directory: ./bootstrap
+        run: terraform plan -out=tfplan
+
+      - name: Bootstrap - Terraform Apply
+        working-directory: ./bootstrap
+        run: terraform apply -auto-approve tfplan
+
+      - name: Get S3 Bucket Name
+        id: tf_output
+        working-directory: ./bootstrap
+        run: |
+          BUCKET_NAME=$(terraform output -raw s3_bucket_name)
+          echo "bucket_name=$BUCKET_NAME" >> $GITHUB_OUTPUT
+          echo "### S3 Backend Created" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Bucket Name:** \`$BUCKET_NAME\`" >> $GITHUB_STEP_SUMMARY
+
+  # Job 2: Infrastructure Apply
+  terraform-apply:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    needs: [bootstrap]
+    if: |
+      always() && 
+      !cancelled() &&
+      (needs.bootstrap.result == 'success' || needs.bootstrap.result == 'skipped') &&
+      (github.event.inputs.action == 'apply' || github.event.inputs.action == 'plan' || github.event_name == 'push')
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get S3 Bucket Name
+        id: get_bucket
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET_NAME="${{ env.PROJECT_NAME }}-state-${ACCOUNT_ID}"
+          echo "bucket_name=$BUCKET_NAME" >> $GITHUB_OUTPUT
+          echo "### Using S3 Backend" >> $GITHUB_STEP_SUMMARY
+          echo "**Bucket:** \`$BUCKET_NAME\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: ./infrastructure
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ steps.get_bucket.outputs.bucket_name }}" \
+            -backend-config="key=infrastructure/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform Format Check
+        working-directory: ./infrastructure
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Validate
+        working-directory: ./infrastructure
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ./infrastructure
+        run: |
+          terraform plan -out=tfplan -no-color | tee plan_output.txt
+          
+          echo "### Terraform Plan" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tail -n 50 plan_output.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Terraform Apply
+        if: github.event.inputs.action != 'plan' && github.event_name == 'push' || github.event.inputs.action == 'apply'
+        working-directory: ./infrastructure
+        run: terraform apply -auto-approve tfplan
+
+      - name: Get Infrastructure Outputs
+        if: github.event.inputs.action != 'plan'
+        id: outputs
+        working-directory: ./infrastructure
+        run: |
+          INSTANCE_ID=$(terraform output -raw instance_id)
+          PUBLIC_IP=$(terraform output -raw instance_public_ip)
+          PUBLIC_DNS=$(terraform output -raw instance_public_dns)
+          WEB_URL=$(terraform output -raw web_url)
+          REGION=$(terraform output -raw aws_region)
+          INSTANCE_TYPE=$(terraform output -raw instance_type)
+          
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+          echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
+          echo "web_url=$WEB_URL" >> $GITHUB_OUTPUT
+
+      - name: Infrastructure Summary
+        if: github.event.inputs.action != 'plan'
+        run: |
+          echo "## Infrastructure Deployed Successfully!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### EC2 Instance Details" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Instance ID** | \`${{ steps.outputs.outputs.instance_id }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Public IP** | \`${{ steps.outputs.outputs.public_ip }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Region** | \`${{ env.AWS_REGION }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Access Your Application" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo " **Web URL:** [${{ steps.outputs.outputs.web_url }}](${{ steps.outputs.outputs.web_url }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> **Note:** Wait 2-3 minutes for the web server to fully start" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "###  Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "-  Test the web application at the URL above" >> $GITHUB_STEP_SUMMARY
+          echo "-  Check AWS Console for instance details" >> $GITHUB_STEP_SUMMARY
+          echo "-  Run 'destroy' action to clean up resources" >> $GITHUB_STEP_SUMMARY
+
+      - name: Comment PR (if applicable)
+        if: github.event_name == 'pull_request' && github.event.inputs.action != 'plan'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Infrastructure Deployed
+              
+              **Instance ID:** \`${{ steps.outputs.outputs.instance_id }}\`
+              **Public IP:** \`${{ steps.outputs.outputs.public_ip }}\`
+              **Web URL:** ${{ steps.outputs.outputs.web_url }}
+              
+               Wait 2-3 minutes for the server to be fully ready.`
+            })
+
+  # Job 3: Infrastructure Destroy
+  terraform-destroy:
+    name: Destroy Infrastructure
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'destroy'
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get S3 Bucket Name
+        id: get_bucket
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET_NAME="${{ env.PROJECT_NAME }}-state-${ACCOUNT_ID}"
+          echo "bucket_name=$BUCKET_NAME" >> $GITHUB_OUTPUT
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: ./infrastructure
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ steps.get_bucket.outputs.bucket_name }}" \
+            -backend-config="key=infrastructure/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform Destroy
+        working-directory: ./infrastructure
+        run: terraform destroy -auto-approve
+
+      - name: Destroy Summary
+        run: |
+          echo "## Infrastructure Destroyed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo " All EC2 resources have been successfully removed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "###  Cleanup Notes" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- EC2 instance deleted" >> $GITHUB_STEP_SUMMARY
+          echo "- Security groups removed" >> $GITHUB_STEP_SUMMARY
+          echo "- S3 backend still exists (run bootstrap destroy if needed)" >> $GITHUB_STEP_SUMMARY
+
+  # Job 4: Destroy Bootstrap (optionnel)
+  destroy-bootstrap:
+    name: Destroy S3 Backend
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'destroy' && github.event.inputs.bootstrap == 'true'
+    needs: [terraform-destroy]
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Bootstrap - Terraform Init
+        working-directory: ./bootstrap
+        run: terraform init
+
+      - name: Bootstrap - Terraform Destroy
+        working-directory: ./bootstrap
+        run: terraform destroy -auto-approve
+
+      - name: Bootstrap Destroy Summary
+        run: |
+          echo "## S3 Backend Destroyed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo " S3 bucket and all resources have been removed" >> $GITHUB_STEP_SUMMARY
